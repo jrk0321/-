@@ -1,0 +1,2012 @@
+# =========================================================
+# KRX Long/Short Quant — v4.1.1-fix2 FULL STANDALONE
+#
+# [v4.1.1-fix2] pykrx 호환성 수정
+#  - SSL 인증서 우회 (macOS Python)
+#  - KRX OTP 직접 크롤링 (pykrx 없이 KRX 데이터 수집)
+#  - FinanceDataReader (네이버 금융 소스) 우선 사용
+#  - pykrx / yfinance 폴백
+# =========================================================
+
+import subprocess, sys, os
+
+# ── 방법 3: SSL 인증서 우회 (macOS Python certifi 문제) ──
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+_PKGS = ["numpy<2.0", "yfinance", "plotly", "kaleido",
+         "scipy", "openpyxl", "tqdm", "certifi", "requests",
+         "beautifulsoup4", "lxml"]
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + _PKGS)
+
+# FinanceDataReader (네이버 금융 기반 — KRX 로그인과 무관)
+FDR_AVAILABLE = False
+try:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "finance-datareader"])
+    import FinanceDataReader as fdr
+    FDR_AVAILABLE = True
+    print("  ✅ FinanceDataReader available (primary source)")
+except Exception as e:
+    print(f"  ⚠️ FinanceDataReader failed: {e}")
+
+# pykrx: 시도는 하되 실패해도 OK
+PYKRX_AVAILABLE = False
+try:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "git+https://github.com/sharebook-kr/pykrx.git"],
+                          stderr=subprocess.DEVNULL)
+    from pykrx import stock
+    PYKRX_AVAILABLE = True
+    print("  ✅ pykrx (GitHub master) available as fallback")
+except Exception:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pykrx"],
+                              stderr=subprocess.DEVNULL)
+        from pykrx import stock
+        PYKRX_AVAILABLE = True
+        print("  ✅ pykrx (PyPI) available as fallback")
+    except Exception:
+        print("  ⚠️ pykrx unavailable")
+
+import numpy as np
+if np.__version__.startswith("2"):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy<2.0"])
+    print("numpy downgraded. Restarting...")
+    os.kill(os.getpid(), 9)
+
+import warnings, math, time, copy
+from collections import OrderedDict
+import pandas as pd
+import requests
+from io import BytesIO
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from tqdm import tqdm
+import yfinance as yf
+from pandas.tseries.offsets import BDay, BMonthBegin
+from scipy.stats import skew, kurtosis, spearmanr
+
+warnings.filterwarnings("ignore")
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 240)
+pd.set_option('display.float_format', lambda x: f'{x:.4f}')
+
+print("=" * 70)
+print(" KRX Long/Short Quant v4.1.1-fix2 — Full Standalone")
+print("=" * 70)
+
+# ================================================================
+#  GLOBAL PARAMS
+# ================================================================
+YEARS              = 7
+UNIVERSE_MKT       = "KOSPI"
+UNIVERSE_N         = 120
+TOP_K              = 30       # v4.1.2: K=30 (민감도 분석 최적값)
+
+USE_LIQ_FILTER     = True
+LIQ_WINDOW         = 60
+MIN_AVG_VALUE      = 5_000_000_000
+
+BETA_SPAN          = 120
+MOM_EWM_SPAN       = 63
+VOL_LOOKBACK       = 60
+
+EMA_SPAN_SIGNAL    = 3
+CONFIRM_DAYS       = 1
+
+COST_BPS_PER_SIDE  = 8
+SIDE_COST          = COST_BPS_PER_SIDE / 10000.0
+BORROW_PA          = 0.02
+
+USDJPY_DIRECTION   = "up"
+
+W_BETADIFF_DEF     = 0.4
+W_MOM_DEF          = 0.4
+W_LOWVOL_DEF       = 0.2
+
+WF_TRAIN_MONTHS    = 24
+WF_TEST_MONTHS     = 6
+WF_STEP_MONTHS     = 6
+
+SHORT_MOM_GUARD_PCT  = 0.80
+FACTOR_CONFLICT_THR  = 1.5
+SHORT_STOP_LOSS      = -0.25
+IC_LOOKBACK          = 63
+IC_MIN_THRESHOLD     = 0.02
+EXPOSURE_SCALE_MIN   = 0.5
+
+OUTDIR = "krx_ls_v411_outputs"
+os.makedirs(OUTDIR, exist_ok=True)
+
+
+# ================================================================
+#  COLUMN NAME RESOLVER (한글/영문 자동 감지)
+# ================================================================
+# pykrx 버전에 따라 컬럼명이 한글 또는 영문일 수 있음
+COL_MAP_KR = {
+    "close": "종가", "open": "시가", "high": "고가", "low": "저가",
+    "volume": "거래량", "value": "거래대금", "mktcap": "시가총액",
+    "change": "등락률",
+}
+COL_MAP_EN = {
+    "close": "Close", "open": "Open", "high": "High", "low": "Low",
+    "volume": "Volume", "value": "TradingValue", "mktcap": "MarketCap",
+    "change": "Change",
+}
+# More possible English column names from newer pykrx
+COL_MAP_EN_ALT = {
+    "close": "종가", "open": "시가", "high": "고가", "low": "저가",
+    "volume": "거래량", "value": "거래대금", "mktcap": "시가총액",
+}
+
+def resolve_col(df, key):
+    """Try to find the right column name for a given semantic key."""
+    for mapping in [COL_MAP_KR, COL_MAP_EN]:
+        col = mapping.get(key)
+        if col and col in df.columns:
+            return col
+    # Fuzzy match
+    for c in df.columns:
+        cl = c.lower()
+        if key == "close" and ("close" in cl or "종가" in cl):
+            return c
+        if key == "volume" and ("vol" in cl or "거래량" in cl):
+            return c
+        if key == "value" and ("value" in cl or "거래대금" in cl or "trading" in cl):
+            return c
+        if key == "mktcap" and ("cap" in cl or "시가총액" in cl or "market" in cl):
+            return c
+    return None
+
+
+# ================================================================
+#  UTILITIES
+# ================================================================
+def prev_business_day(ts=None):
+    d = pd.Timestamp.today().normalize() if ts is None else pd.Timestamp(ts).normalize()
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d
+
+def start_end():
+    end = prev_business_day()
+    start = end - pd.DateOffset(years=YEARS)
+    return start.normalize(), end.normalize()
+
+def safe_pct(s):
+    return pd.to_numeric(s, errors="coerce").pct_change().fillna(0.0)
+
+def rolling_beta_ewm(y, x, span=BETA_SPAN):
+    y = pd.to_numeric(y, errors="coerce").fillna(0.0)
+    x = pd.to_numeric(x, errors="coerce").fillna(0.0)
+    ye = y.ewm(span=span, adjust=False).mean()
+    xe = x.ewm(span=span, adjust=False).mean()
+    cov = ((y - ye) * (x - xe)).ewm(span=span, adjust=False).mean()
+    var = ((x - xe) ** 2).ewm(span=span, adjust=False).mean().replace(0, np.nan)
+    return cov / var
+
+
+def rolling_multi_beta_ewm(y, x1, x2, span=BETA_SPAN):
+    """
+    다중회귀 EWM 베타: y = b1*x1 + b2*x2 + e
+    USDKRW와 NDX를 동시에 추정하여 상호 상관 제거.
+    Returns: (beta1, beta2) — 각각의 "순수" 민감도
+    """
+    y  = pd.to_numeric(y, errors="coerce").fillna(0.0)
+    x1 = pd.to_numeric(x1, errors="coerce").fillna(0.0)
+    x2 = pd.to_numeric(x2, errors="coerce").fillna(0.0)
+
+    ym  = y.ewm(span=span, adjust=False).mean()
+    x1m = x1.ewm(span=span, adjust=False).mean()
+    x2m = x2.ewm(span=span, adjust=False).mean()
+
+    dy  = y - ym
+    dx1 = x1 - x1m
+    dx2 = x2 - x2m
+
+    # EWM covariance matrix elements
+    c11 = (dx1 * dx1).ewm(span=span, adjust=False).mean()
+    c12 = (dx1 * dx2).ewm(span=span, adjust=False).mean()
+    c22 = (dx2 * dx2).ewm(span=span, adjust=False).mean()
+    cy1 = (dy * dx1).ewm(span=span, adjust=False).mean()
+    cy2 = (dy * dx2).ewm(span=span, adjust=False).mean()
+
+    # 2x2 OLS: [b1, b2] = inv(X'X) * X'y
+    det = c11 * c22 - c12 * c12
+    det = det.replace(0, np.nan)
+
+    b1 = (c22 * cy1 - c12 * cy2) / det
+    b2 = (c11 * cy2 - c12 * cy1) / det
+
+    return b1.fillna(0.0), b2.fillna(0.0)
+
+def zscore_cs(row):
+    m, s = row.mean(), row.std()
+    if s == 0 or pd.isna(s):
+        return row * 0
+    return (row - m) / s
+
+def ann_sharpe(rets):
+    if len(rets) < 20:
+        return np.nan
+    m, s = rets.mean(), rets.std()
+    if s == 0 or pd.isna(s):
+        return 0.0
+    return m / s * np.sqrt(252)
+
+def ann_cagr(equity):
+    if len(equity) < 20:
+        return np.nan
+    days = (equity.index[-1] - equity.index[0]).days
+    if days <= 0:
+        return 0.0
+    return (equity.iloc[-1] / equity.iloc[0]) ** (365.25 / days) - 1
+
+def max_dd(equity):
+    peak = equity.cummax()
+    dd = equity / peak - 1
+    return dd.min()
+
+def max_dd_duration(equity):
+    peak = equity.cummax()
+    underwater = peak > equity
+    if not underwater.any():
+        return 0
+    groups = (~underwater).cumsum()
+    durations = underwater.groupby(groups).sum()
+    return int(durations.max()) if len(durations) > 0 else 0
+
+def sortino(rets):
+    m = rets.mean()
+    ds = rets[rets < 0].std()
+    if ds == 0 or pd.isna(ds):
+        return 0.0
+    return m / ds * np.sqrt(252)
+
+def calmar(equity, rets):
+    c = ann_cagr(equity)
+    d = abs(max_dd(equity))
+    if d == 0:
+        return 0.0
+    return c / d
+
+def profit_factor(rets):
+    gains = rets[rets > 0].sum()
+    losses = abs(rets[rets < 0].sum())
+    if losses == 0:
+        return np.inf if gains > 0 else 0.0
+    return gains / losses
+
+def full_metrics(rets, label=""):
+    eq = (1 + rets).cumprod()
+    return OrderedDict([
+        ("Strategy", label),
+        ("Sharpe", round(ann_sharpe(rets), 4)),
+        ("CAGR", round(ann_cagr(eq), 4)),
+        ("MaxDD", round(max_dd(eq), 4)),
+        ("Sortino", round(sortino(rets), 4)),
+        ("Calmar", round(calmar(eq, rets), 4)),
+        ("ProfitFactor", round(profit_factor(rets), 4)),
+        ("Skew", round(float(skew(rets.dropna())), 4)),
+        ("Kurt", round(float(kurtosis(rets.dropna())), 4)),
+        ("WinRate", round((rets > 0).mean(), 4)),
+        ("MaxDD_Duration", max_dd_duration(eq)),
+        ("Days", len(rets)),
+    ])
+
+
+# ================================================================
+#  방법 2: KRX OTP 직접 크롤링 (pykrx 없이)
+# ================================================================
+KRX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101",
+}
+
+def krx_otp_request(otp_params):
+    """KRX OTP 방식으로 데이터 요청 (generate → download 2단계)"""
+    try:
+        otp_url = "http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
+        r1 = requests.post(otp_url, data=otp_params, headers=KRX_HEADERS, timeout=15)
+        if r1.status_code != 200 or len(r1.text) < 10:
+            return None
+        otp = r1.text
+
+        down_url = "http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
+        r2 = requests.post(down_url, data={"code": otp}, headers=KRX_HEADERS, timeout=30)
+        if r2.status_code != 200:
+            return None
+
+        df = pd.read_csv(BytesIO(r2.content), encoding="euc-kr")
+        return df
+    except Exception as e:
+        return None
+
+
+def krx_get_market_cap_by_date(date_str):
+    """KRX OTP로 특정일 시가총액 순위 가져오기"""
+    params = {
+        "locale": "ko_KR",
+        "mktId": "STK",  # KOSPI
+        "trdDd": date_str,
+        "share": "1",
+        "money": "1",
+        "csvxls_is498": "false",
+        "name": "fileDown",
+        "url": "dbms/MDC/STAT/standard/MDCSTAT01501",
+    }
+    df = krx_otp_request(params)
+    if df is not None and len(df) > 10:
+        # 종목코드 컬럼 찾기
+        code_col = None
+        for c in df.columns:
+            if "종목코드" in str(c) or "코드" in str(c) or "ISU_SRT_CD" in str(c):
+                code_col = c
+                break
+        if code_col is None and len(df.columns) > 0:
+            code_col = df.columns[0]
+
+        if code_col:
+            df[code_col] = df[code_col].astype(str).str.zfill(6)
+            df = df.set_index(code_col)
+        return df
+    return None
+
+
+def krx_get_ohlcv_by_date(start_str, end_str, ticker):
+    """KRX OTP로 개별 종목 OHLCV 가져오기"""
+    params = {
+        "locale": "ko_KR",
+        "isuCd": ticker,
+        "isuCd2": "",
+        "strtDd": start_str,
+        "endDd": end_str,
+        "adjStkPrc_check": "Y",  # 수정주가
+        "adjStkPrc": "2",
+        "share": "1",
+        "money": "1",
+        "csvxls_isNo": "false",
+        "name": "fileDown",
+        "url": "dbms/MDC/STAT/standard/MDCSTAT01701",
+    }
+    df = krx_otp_request(params)
+    if df is not None and len(df) > 10:
+        # 날짜 컬럼 찾기
+        date_col = None
+        for c in df.columns:
+            if "일자" in str(c) or "날짜" in str(c) or "TRD_DD" in str(c):
+                date_col = c
+                break
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col])
+            df = df.set_index(date_col).sort_index()
+        return df
+    return None
+
+
+# ================================================================
+#  데이터 소스 PROBE (우선순위: FDR > KRX OTP > pykrx > yfinance)
+# ================================================================
+DATA_SOURCE = None
+
+def probe_fdr():
+    """FinanceDataReader로 유니버스 + OHLCV 가능 여부 확인"""
+    global DATA_SOURCE
+    if not FDR_AVAILABLE:
+        return None
+    try:
+        listing = fdr.StockListing("KOSPI")
+        if listing is not None and len(listing) > 10:
+            print(f"  [FDR] StockListing OK ({len(listing)} rows)")
+            DATA_SOURCE = "fdr"
+            return listing
+    except Exception as e:
+        print(f"  [FDR] StockListing FAIL: {e}")
+    return None
+
+
+def probe_krx_otp():
+    """KRX OTP 직접 크롤링 테스트"""
+    global DATA_SOURCE
+    td = prev_business_day().strftime("%Y%m%d")
+    try:
+        df = krx_get_market_cap_by_date(td)
+        if df is not None and len(df) > 10:
+            print(f"  [KRX OTP] Market cap OK ({len(df)} rows)")
+            DATA_SOURCE = "krx_otp"
+            return df
+    except Exception as e:
+        print(f"  [KRX OTP] FAIL: {e}")
+    return None
+
+
+def probe_pykrx():
+    """pykrx 프로브"""
+    global DATA_SOURCE
+    if not PYKRX_AVAILABLE:
+        return None
+    td = prev_business_day().strftime("%Y%m%d")
+    try:
+        r = stock.get_market_cap_by_ticker(td, market="KOSPI")
+        if r is not None and not r.empty and len(r) > 10:
+            print(f"  [pykrx] get_market_cap_by_ticker OK ({len(r)} rows)")
+            DATA_SOURCE = "pykrx_cap"
+            return r
+    except Exception as e:
+        print(f"  [pykrx] FAIL: {e}")
+    return None
+
+
+# KOSPI 대표 종목 하드코딩 (최후의 폴백)
+KOSPI_TOP120_FALLBACK = [
+    "005930", "000660", "373220", "207940", "005935", "006400", "005380",
+    "035420", "000270", "068270", "051910", "105560", "003670", "055550",
+    "035720", "096770", "028260", "012330", "066570", "034730", "032830",
+    "015760", "003490", "259960", "138040", "018260", "011200", "033780",
+    "017670", "316140", "009150", "086790", "010130", "034020", "323410",
+    "030200", "047050", "329180", "000810", "024110", "010950", "009540",
+    "036570", "011170", "001570", "352820", "267260", "090430", "402340",
+    "003550", "000720", "010140", "377300", "051900", "161390", "078930",
+    "326030", "180640", "004020", "006800", "009830", "021240", "271560",
+    "088980", "302440", "361610", "036460", "011780", "042700", "307950",
+    "128940", "022100", "004990", "000100", "005490", "016360", "066970",
+    "010620", "005830", "097950", "009240", "100220", "241560", "028050",
+    "007070", "069500", "003410", "002790", "004370", "006260", "036490",
+    "138930", "383220", "452260", "039490", "011070", "000990", "018880",
+    "001040", "002380", "008770", "000880", "008560", "029780", "006360",
+    "047810", "192820", "139480", "020150", "071050", "014680", "251270",
+    "004170", "240810", "272210", "005850", "002350", "001450", "000150",
+    "003530",
+]
+
+
+print("\n[PROBE] Checking data sources (FDR → KRX OTP → pykrx → yfinance)...")
+
+# 1순위: FDR (네이버 금융 기반, KRX 로그인과 무관)
+probe_result = probe_fdr()
+
+# 2순위: KRX OTP 직접 크롤링
+if DATA_SOURCE is None:
+    probe_result = probe_krx_otp()
+
+# 3순위: pykrx
+if DATA_SOURCE is None:
+    probe_result = probe_pykrx()
+
+# 4순위: yfinance + 하드코딩 유니버스
+if DATA_SOURCE is None:
+    print("  [yfinance] Using hardcoded KOSPI Top120")
+    DATA_SOURCE = "yfinance"
+
+print(f"\n  ✅ Data Source: {DATA_SOURCE}")
+
+
+# ================================================================
+#  KRX OpenAPI — 진정한 PIT Universe (과거 시점 시총 순위)
+# ================================================================
+KRX_API_KEY = "B659918BCBC4412BAB77D3BDC619E7D630CD5482"
+
+def krx_openapi_stock_daily(bas_dd):
+    """KRX OpenAPI로 특정일 유가증권 일별매매정보 조회 (시총 포함)"""
+    url = "https://data-dbg.krx.co.kr/svc/apis/sto/stk_bydd_trd"
+    params = {"basDd": bas_dd}
+    headers = {"AUTH_KEY": KRX_API_KEY}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if "OutBlock_1" not in data or len(data["OutBlock_1"]) == 0:
+            return None
+        df = pd.json_normalize(data["OutBlock_1"])
+        return df
+    except Exception:
+        return None
+
+
+def build_pit_universe_krx_openapi(start, end, N):
+    """KRX OpenAPI 기반 진정한 PIT Universe — 분기 말 실제 시총 기준"""
+    quarter_ends = pd.date_range(start, end, freq="QE")
+    universe_by_quarter = {}
+    all_tickers_set = set()
+    success = 0
+
+    for qe in tqdm(quarter_ends, desc="PIT Universe (KRX OpenAPI)"):
+        d = qe
+        # 주말이면 금요일로
+        for _ in range(5):
+            if d.weekday() < 5:
+                break
+            d -= pd.Timedelta(days=1)
+
+        df = krx_openapi_stock_daily(d.strftime("%Y%m%d"))
+        # 빈 데이터면 며칠 전으로 재시도
+        if df is None:
+            for offset in [-1, -2, -3, -4, -5]:
+                d2 = d + pd.Timedelta(days=offset)
+                df = krx_openapi_stock_daily(d2.strftime("%Y%m%d"))
+                if df is not None:
+                    break
+                time.sleep(0.12)
+
+        if df is not None and len(df) > 10:
+            # 실제 응답 컬럼: ISU_CD, MKTCAP, ISU_NM 등
+            df["MKTCAP"] = pd.to_numeric(df["MKTCAP"], errors="coerce")
+            df = df.sort_values("MKTCAP", ascending=False)
+            codes = df["ISU_CD"].astype(str).str.zfill(6).tolist()[:N]
+            top_n = set(codes)
+            universe_by_quarter[qe] = top_n
+            all_tickers_set |= top_n
+            success += 1
+        time.sleep(0.12)  # rate limit
+
+    print(f"  KRX OpenAPI PIT: {success}/{len(quarter_ends)} quarters OK, "
+          f"{len(all_tickers_set)} unique tickers")
+    return universe_by_quarter, sorted(list(all_tickers_set)), quarter_ends
+
+
+def build_pit_universe_fdr(start, end, N):
+    """
+    FDR 기반 동적 PIT Universe — close × 상장주식수로 일별 시총 역산.
+    월별로 시총 Top N을 재구성하여 survivorship bias 감소.
+    """
+    print("  [FDR PIT] Loading full KOSPI listing for shares outstanding...")
+    try:
+        listing = fdr.StockListing("KOSPI")
+    except Exception as e:
+        print(f"  FDR StockListing failed: {e}")
+        return {}, [], pd.DatetimeIndex([])
+
+    code_col = "Code" if "Code" in listing.columns else listing.columns[0]
+    name_col = "Name" if "Name" in listing.columns else None
+
+    # 상장주식수 컬럼 찾기
+    shares_col = None
+    for c in ["Shares", "ListedShares", "상장주식수", "ListShrs"]:
+        if c in listing.columns:
+            shares_col = c
+            break
+
+    all_codes = listing[code_col].astype(str).str.zfill(6).tolist()
+    shares_map = {}
+    if shares_col:
+        for _, row in listing.iterrows():
+            tk = str(row[code_col]).zfill(6)
+            shares_map[tk] = pd.to_numeric(row[shares_col], errors="coerce")
+        print(f"  [FDR PIT] Shares outstanding available for {len(shares_map)} tickers")
+    else:
+        # 상장주식수가 없으면 시총(Marcap) 직접 사용
+        marcap_col = None
+        for c in ["Marcap", "MarketCap", "시가총액"]:
+            if c in listing.columns:
+                marcap_col = c
+                break
+        if marcap_col:
+            # 현재 시총 / 현재 종가 = 상장주식수 역산
+            close_col_l = None
+            for c in ["Close", "종가", "ClosePrice"]:
+                if c in listing.columns:
+                    close_col_l = c
+                    break
+            if close_col_l:
+                for _, row in listing.iterrows():
+                    tk = str(row[code_col]).zfill(6)
+                    mc = pd.to_numeric(row[marcap_col], errors="coerce")
+                    cl = pd.to_numeric(row[close_col_l], errors="coerce")
+                    if pd.notna(mc) and pd.notna(cl) and cl > 0:
+                        shares_map[tk] = mc / cl
+                print(f"  [FDR PIT] Shares estimated from Marcap/Close for {len(shares_map)} tickers")
+            else:
+                print("  [FDR PIT] ⚠️ Cannot estimate shares — falling back to static")
+
+    if not shares_map:
+        # 최후 폴백: 정적 유니버스
+        marcap_col = None
+        for c in ["Marcap", "MarketCap", "시가총액"]:
+            if c in listing.columns:
+                marcap_col = c
+                break
+        if marcap_col:
+            listing = listing.sort_values(marcap_col, ascending=False)
+        top_n = set(listing[code_col].astype(str).str.zfill(6).tolist()[:N])
+        quarter_ends = pd.date_range(start, end, freq="QE")
+        universe_by_quarter = {qe: top_n for qe in quarter_ends}
+        print(f"  FDR PIT (static fallback): {len(top_n)} tickers")
+        return universe_by_quarter, sorted(list(top_n)), quarter_ends
+
+    # 넓은 범위의 종목 OHLCV를 가져와서 일별 시총 계산
+    # 이미 close_dict에 데이터가 없으니 여기서 간이 fetch
+    print(f"  [FDR PIT] Fetching price data for ~{min(250, len(all_codes))} tickers to compute monthly mktcap...")
+    # 상위 250개 정도만 가져오면 Top 120은 충분히 커버
+    candidate_tickers = all_codes[:min(250, len(all_codes))]
+
+    pit_close = {}
+    for tk in tqdm(candidate_tickers, desc="PIT OHLCV"):
+        try:
+            df = fdr.DataReader(tk, start, end)
+            if df is not None and not df.empty and len(df) > 30:
+                pit_close[tk] = df["Close"]
+        except Exception:
+            pass
+        time.sleep(0.03)
+
+    if not pit_close:
+        print("  [FDR PIT] No price data — static fallback")
+        top_n = set(candidate_tickers[:N])
+        quarter_ends = pd.date_range(start, end, freq="QE")
+        return {qe: top_n for qe in quarter_ends}, sorted(list(top_n)), quarter_ends
+
+    pit_close_df = pd.DataFrame(pit_close).sort_index().ffill()
+
+    # 일별 시총 = close × 상장주식수
+    mktcap_df = pit_close_df.copy()
+    for tk in mktcap_df.columns:
+        if tk in shares_map and pd.notna(shares_map[tk]):
+            mktcap_df[tk] = mktcap_df[tk] * shares_map[tk]
+        else:
+            mktcap_df[tk] = np.nan  # 상장주식수 없으면 제외
+
+    # 월별 리밸런싱 날짜마다 시총 Top N 구성
+    month_ends = pd.date_range(start, end, freq="BME")
+    universe_by_month = {}
+    all_tickers_set = set()
+
+    for me in month_ends:
+        # 해당 월말 이전 가장 가까운 거래일
+        valid_dates = mktcap_df.index[mktcap_df.index <= me]
+        if len(valid_dates) == 0:
+            continue
+        dt = valid_dates[-1]
+        row = mktcap_df.loc[dt].dropna().sort_values(ascending=False)
+        top_n = set(row.head(N).index.tolist())
+        universe_by_month[me] = top_n
+        all_tickers_set |= top_n
+
+    # quarter_ends 대신 month_ends 사용 (더 세밀한 PIT)
+    unique_counts = [len(v) for v in universe_by_month.values()]
+    # 분기별로 변하는 종목 수 확인
+    if len(universe_by_month) >= 2:
+        months_list = sorted(universe_by_month.keys())
+        changes = []
+        for i in range(1, len(months_list)):
+            prev = universe_by_month[months_list[i-1]]
+            curr = universe_by_month[months_list[i]]
+            changes.append(len(curr - prev))
+        avg_change = np.mean(changes) if changes else 0
+        print(f"  [FDR PIT] Dynamic: {len(month_ends)} months, "
+              f"{len(all_tickers_set)} unique tickers, "
+              f"avg {avg_change:.1f} changes/month")
+    else:
+        print(f"  [FDR PIT] Dynamic: {len(month_ends)} months, "
+              f"{len(all_tickers_set)} unique tickers")
+
+    return universe_by_month, sorted(list(all_tickers_set)), pd.DatetimeIndex(sorted(universe_by_month.keys()))
+
+
+def get_pit_eligible(dt, universe_by_quarter, quarter_ends):
+    """주어진 날짜에 대해 가장 최근 분기 말 이전의 유니버스를 반환"""
+    past_quarters = quarter_ends[quarter_ends <= dt]
+    if len(past_quarters) == 0:
+        if len(quarter_ends) > 0:
+            return universe_by_quarter.get(quarter_ends[0], set())
+        return set()
+    latest = past_quarters[-1]
+    return universe_by_quarter.get(latest, set())
+
+
+# ================================================================
+#  DATA FETCH
+# ================================================================
+START, END = start_end()
+START_STR = START.strftime("%Y%m%d")
+END_STR   = END.strftime("%Y%m%d")
+print(f"\n[DATA] Period: {START_STR} ~ {END_STR}")
+
+# ── PIT Universe: KRX OpenAPI (진정한 PIT) > FDR (폴백) ──
+print("[DATA] Building Point-in-Time Universe...")
+
+PIT_SOURCE = "none"
+print("  Trying KRX OpenAPI for true PIT Universe...")
+test_df = None
+# 최근 영업일 데이터가 비어있을 수 있으므로 며칠 전까지 재시도
+for day_offset in range(0, 10):
+    test_date = prev_business_day() - pd.Timedelta(days=day_offset)
+    while test_date.weekday() >= 5:
+        test_date -= pd.Timedelta(days=1)
+    test_df = krx_openapi_stock_daily(test_date.strftime("%Y%m%d"))
+    if test_df is not None and len(test_df) > 10:
+        print(f"  ✅ KRX OpenAPI works! (date={test_date.strftime('%Y%m%d')}, "
+              f"{len(test_df)} rows)")
+        break
+    test_df = None
+
+if test_df is not None and len(test_df) > 10:
+    universe_by_quarter, all_universe_tickers, quarter_ends = build_pit_universe_krx_openapi(
+        START, END, UNIVERSE_N
+    )
+    USE_PIT_UNIVERSE = True
+    PIT_SOURCE = "KRX_OpenAPI"
+elif FDR_AVAILABLE:
+    print("  KRX OpenAPI unavailable, using FDR dynamic PIT (close × shares)...")
+    universe_by_quarter, all_universe_tickers, quarter_ends = build_pit_universe_fdr(
+        START, END, UNIVERSE_N
+    )
+    USE_PIT_UNIVERSE = True
+    PIT_SOURCE = "FDR_dynamic"
+else:
+    # FDR 불가 시 현재 시점 고정 유니버스 (폴백)
+    if DATA_SOURCE == "krx_otp":
+        df_cap = probe_result
+        mktcap_col = None
+        for c in df_cap.columns:
+            if "시가총액" in str(c) or "MKTCAP" in str(c):
+                mktcap_col = c
+                break
+        if mktcap_col:
+            df_cap[mktcap_col] = pd.to_numeric(df_cap[mktcap_col].astype(str).str.replace(",", ""), errors="coerce")
+            df_cap = df_cap.sort_values(mktcap_col, ascending=False)
+        all_universe_tickers = df_cap.index.tolist()[:UNIVERSE_N]
+    elif DATA_SOURCE == "pykrx_cap":
+        cap = probe_result
+        mktcap_col = resolve_col(cap, "mktcap")
+        if mktcap_col:
+            cap = cap.sort_values(mktcap_col, ascending=False)
+        all_universe_tickers = cap.index.tolist()[:UNIVERSE_N]
+    else:
+        all_universe_tickers = KOSPI_TOP120_FALLBACK[:UNIVERSE_N]
+    universe_by_quarter = {}
+    quarter_ends = pd.DatetimeIndex([])
+    USE_PIT_UNIVERSE = False
+    print(f"  ⚠️ PIT Universe unavailable — using static universe ({len(all_universe_tickers)} tickers)")
+
+print(f"  Fetching OHLCV for {len(all_universe_tickers)} tickers...")
+
+
+# --- OHLCV Fetch ---
+close_dict = {}
+volume_dict = {}
+value_dict = {}
+
+
+def fetch_ohlcv_fdr(tk, start, end):
+    """FinanceDataReader로 개별 종목 OHLCV (네이버 금융 소스)"""
+    try:
+        df = fdr.DataReader(tk, start, end)
+        if df is None or df.empty or len(df) < 60:
+            return None, None, None
+        close = df["Close"]
+        volume = df["Volume"] if "Volume" in df.columns else close * 0
+        value = close * volume
+        return close, volume, value
+    except Exception:
+        return None, None, None
+
+
+def fetch_ohlcv_krx_otp(tk, start_str, end_str):
+    """KRX OTP로 개별 종목 OHLCV"""
+    try:
+        df = krx_get_ohlcv_by_date(start_str, end_str, tk)
+        if df is None or df.empty or len(df) < 60:
+            return None, None, None
+        # 종가 컬럼 찾기
+        close_col = None
+        for c in df.columns:
+            if "종가" in str(c) or "TDD_CLSPRC" in str(c):
+                close_col = c
+                break
+        if close_col is None and len(df.columns) >= 4:
+            close_col = df.columns[3]
+
+        vol_col = None
+        for c in df.columns:
+            if "거래량" in str(c) or "ACC_TRDVOL" in str(c):
+                vol_col = c
+                break
+
+        val_col = None
+        for c in df.columns:
+            if "거래대금" in str(c) or "ACC_TRDVAL" in str(c):
+                val_col = c
+                break
+
+        close = pd.to_numeric(df[close_col].astype(str).str.replace(",", ""), errors="coerce")
+        volume = pd.to_numeric(df[vol_col].astype(str).str.replace(",", ""), errors="coerce") if vol_col else close * 0
+        value = pd.to_numeric(df[val_col].astype(str).str.replace(",", ""), errors="coerce") if val_col else close * volume
+
+        return close, volume, value
+    except Exception:
+        return None, None, None
+
+
+def fetch_ohlcv_pykrx(tk, start_str, end_str):
+    """pykrx로 개별 종목 OHLCV"""
+    if not PYKRX_AVAILABLE:
+        return None, None, None
+    try:
+        df = stock.get_market_ohlcv_by_date(start_str, end_str, tk)
+        if df is None or df.empty or len(df) < 60:
+            return None, None, None
+        close_col = resolve_col(df, "close")
+        vol_col = resolve_col(df, "volume")
+        val_col = resolve_col(df, "value")
+        if close_col is None:
+            if len(df.columns) >= 4:
+                close_col = df.columns[3]
+                vol_col = df.columns[4] if len(df.columns) > 4 else None
+                val_col = df.columns[5] if len(df.columns) > 5 else None
+            else:
+                return None, None, None
+        close = df[close_col]
+        volume = df[vol_col] if vol_col else close * 0
+        value = df[val_col] if (val_col and val_col in df.columns) else close * volume
+        return close, volume, value
+    except Exception:
+        return None, None, None
+
+
+def fetch_ohlcv_yfinance(tk, start, end):
+    """yfinance로 한국 종목 OHLCV (.KS suffix)"""
+    try:
+        yf_tk = f"{tk}.KS"
+        df = yf.download(yf_tk, start=start, end=end, progress=False, auto_adjust=True)
+        if df is None or df.empty or len(df) < 60:
+            return None, None, None
+        close = df["Close"].squeeze()
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        volume = df["Volume"].squeeze()
+        if isinstance(volume, pd.DataFrame):
+            volume = volume.iloc[:, 0]
+        value = close * volume
+        return close, volume, value
+    except Exception:
+        return None, None, None
+
+
+# Fetch 우선순위: FDR > KRX OTP > pykrx > yfinance
+fetch_funcs = []
+if FDR_AVAILABLE:
+    fetch_funcs.append(("FDR", lambda tk: fetch_ohlcv_fdr(tk, START, END)))
+fetch_funcs.append(("KRX_OTP", lambda tk: fetch_ohlcv_krx_otp(tk, START_STR, END_STR)))
+if PYKRX_AVAILABLE:
+    fetch_funcs.append(("pykrx", lambda tk: fetch_ohlcv_pykrx(tk, START_STR, END_STR)))
+fetch_funcs.append(("yfinance", lambda tk: fetch_ohlcv_yfinance(tk, START, END)))
+
+# 첫 종목으로 어떤 소스가 작동하는지 테스트
+print(f"  Testing data sources with {all_universe_tickers[0]}...")
+working_source = None
+for src_name, fetch_fn in fetch_funcs:
+    c, v, val = fetch_fn(all_universe_tickers[0])
+    if c is not None:
+        working_source = src_name
+        print(f"  ✅ {src_name} works! Using as primary source.")
+        close_dict[all_universe_tickers[0]] = c
+        volume_dict[all_universe_tickers[0]] = v
+        value_dict[all_universe_tickers[0]] = val
+        break
+    else:
+        print(f"  ❌ {src_name} failed for {all_universe_tickers[0]}")
+
+if working_source is None:
+    print("  ⚠️ All sources failed for test ticker!")
+
+# 나머지 종목은 작동하는 소스 우선 사용
+remaining = [tk for tk in all_universe_tickers if tk not in close_dict]
+fail_count = 0
+for tk in tqdm(remaining, desc="OHLCV"):
+    fetched = False
+    for src_name, fetch_fn in fetch_funcs:
+        close, volume, value = fetch_fn(tk)
+        if close is not None:
+            close_dict[tk] = close
+            volume_dict[tk] = volume
+            value_dict[tk] = value
+            fetched = True
+            break
+    if not fetched:
+        fail_count += 1
+    time.sleep(0.05)
+
+if fail_count > 0:
+    print(f"  ⚠️ {fail_count} tickers failed to fetch")
+
+close_df = pd.DataFrame(close_dict).sort_index()
+close_df = close_df.ffill().dropna(axis=1, thresh=int(len(close_df) * 0.5))
+volume_df = pd.DataFrame(volume_dict).reindex(close_df.index).ffill()
+value_df  = pd.DataFrame(value_dict).reindex(close_df.index).ffill()
+ret_df = close_df.pct_change().fillna(0.0)
+
+all_tickers = list(close_df.columns)
+print(f"  Loaded: {len(all_tickers)} tickers, {len(close_df)} days")
+
+delisted = len(all_universe_tickers) - len(all_tickers)
+print(f"  Delisted/Filtered: {delisted}")
+
+# --- Macro data ---
+print("[DATA] Fetching macro data...")
+
+def fetch_yf(ticker, label):
+    for t in ([ticker] if isinstance(ticker, str) else ticker):
+        try:
+            d = yf.download(t, start=START, end=END + pd.Timedelta(days=5),
+                            progress=False, auto_adjust=True)
+            if d is not None and len(d) > 50:
+                s = d["Close"].squeeze()
+                if isinstance(s, pd.DataFrame):
+                    s = s.iloc[:, 0]
+                print(f"  {label}: {t} OK ({len(s)} rows)")
+                return s
+        except Exception:
+            continue
+    print(f"  {label}: ALL FAILED")
+    return None
+
+macro_tickers = {
+    "USDKRW": "KRW=X",
+    "USDJPY": "JPY=X",
+    "DXY":    "DX-Y.NYB",
+    "GOLD":   "GC=F",
+    "NDX":    ["QQQ", "^NDX", "^IXIC"],
+}
+
+macro_raw = {}
+for name, tk in macro_tickers.items():
+    macro_raw[name] = fetch_yf(tk, name)
+
+macro_df = pd.DataFrame(macro_raw).reindex(close_df.index).ffill().bfill()
+print(f"  Macro aligned: {len(macro_df)} rows, cols={list(macro_df.columns)}")
+
+if macro_df["NDX"].isna().sum() > len(macro_df) * 0.5:
+    print("  ⚠️ NDX data mostly NaN — beta_ndx will be unreliable!")
+
+
+# ================================================================
+#  FACTOR ENGINE (v4.2: 다중회귀 베타 + skip-1w momentum)
+# ================================================================
+print("\n[FACTORS] Computing (v4.2 — multivariate beta)...")
+
+ret_usdkrw = safe_pct(macro_df["USDKRW"])
+ret_ndx    = safe_pct(macro_df["NDX"])
+
+# KOSPI 수익률 (선물 헤지용)
+print("  Fetching KOSPI index for futures hedge...")
+kospi_raw = fetch_yf("^KS11", "KOSPI_IDX")
+if kospi_raw is not None:
+    ret_kospi = kospi_raw.reindex(close_df.index).ffill().pct_change().fillna(0.0)
+    print(f"  KOSPI index: {len(ret_kospi)} rows")
+else:
+    ret_kospi = pd.Series(0.0, index=close_df.index)
+    print("  ⚠️ KOSPI index unavailable — futures hedge will be flat")
+
+print("  Computing multivariate betas (USDKRW + NDX simultaneous)...")
+beta_usdkrw = pd.DataFrame(index=ret_df.index, columns=ret_df.columns, dtype=float)
+beta_ndx    = pd.DataFrame(index=ret_df.index, columns=ret_df.columns, dtype=float)
+
+# KOSPI 베타 (선물 헤지 비율 계산용)
+beta_kospi  = pd.DataFrame(index=ret_df.index, columns=ret_df.columns, dtype=float)
+
+for tk in tqdm(all_tickers, desc="MultiBetas"):
+    b_usd, b_ndx = rolling_multi_beta_ewm(ret_df[tk], ret_usdkrw, ret_ndx, BETA_SPAN)
+    beta_usdkrw[tk] = b_usd
+    beta_ndx[tk]    = b_ndx
+    # KOSPI 베타 (단변량 — 선물 헤지용)
+    beta_kospi[tk] = rolling_beta_ewm(ret_df[tk], ret_kospi, BETA_SPAN)
+
+factor_betadiff = beta_usdkrw - beta_ndx
+
+# Skip-1-week Momentum: 최근 5일 수익 제거 → 단기 반전 효과 회피
+mom_raw = ret_df.ewm(span=MOM_EWM_SPAN, min_periods=20).mean()
+mom_1w  = ret_df.rolling(5, min_periods=3).mean()  # 최근 1주 수익
+factor_mom = mom_raw - mom_1w  # skip-1w momentum
+
+factor_lowvol = -ret_df.rolling(VOL_LOOKBACK, min_periods=20).std()
+
+z_betadiff = factor_betadiff.apply(zscore_cs, axis=1)
+z_mom      = factor_mom.apply(zscore_cs, axis=1)
+z_lowvol   = factor_lowvol.apply(zscore_cs, axis=1)
+
+print("  Factors ready (multivariate beta + skip-1w momentum).")
+
+
+# ================================================================
+#  MACRO GATE
+# ================================================================
+def build_macro_gate(macro):
+    ret_ndx_    = safe_pct(macro["NDX"])
+    ret_usdjpy_ = safe_pct(macro["USDJPY"])
+    ret_dxy_    = safe_pct(macro["DXY"])
+    ret_gold_   = safe_pct(macro["GOLD"])
+    ret_usdkrw_ = safe_pct(macro["USDKRW"])
+
+    def ema_sig(series, direction="up"):
+        ema = series.ewm(span=EMA_SPAN_SIGNAL, adjust=False).mean()
+        if direction == "up":
+            return (series > ema).astype(int)
+        else:
+            return (series < ema).astype(int)
+
+    sig_ndx    = ema_sig(ret_ndx_, "down")
+    sig_usdjpy = ema_sig(ret_usdjpy_, USDJPY_DIRECTION)
+    sig_dxy    = ema_sig(ret_dxy_, "up")
+    sig_gold   = ema_sig(ret_gold_, "up")
+    sig_krw    = ema_sig(ret_usdkrw_, "up")
+
+    gate = (sig_ndx + sig_usdjpy + sig_dxy + sig_gold + sig_krw).clip(0, 5)
+    return gate, {"NDX": sig_ndx, "USDJPY": sig_usdjpy,
+                  "DXY": sig_dxy, "GOLD": sig_gold, "KRW": sig_krw}
+
+gate_signal, gate_components = build_macro_gate(macro_df)
+
+
+# ================================================================
+#  REBALANCE DATES
+# ================================================================
+def get_rebal_dates(idx, mode="K5"):
+    dates = []
+    for ym in idx.to_period("M").unique():
+        month_days = idx[(idx.year == ym.year) & (idx.month == ym.month)]
+        if len(month_days) >= 5:
+            dates.append(month_days[4])
+        elif len(month_days) > 0:
+            dates.append(month_days[-1])
+    return sorted(set(dates))
+
+dates_all = get_rebal_dates(close_df.index)
+print(f"\n[REBAL] {len(dates_all)} rebalance dates")
+
+
+# ================================================================
+#  PIT LIQUIDITY MASK (Look-Ahead Free)
+# ================================================================
+print("[SETUP] Computing PIT Liquidity Mask...")
+if USE_LIQ_FILTER:
+    # Rolling 평균 거래대금 — 미래 데이터 사용 없음
+    liq_mask = value_df.rolling(LIQ_WINDOW, min_periods=max(1, LIQ_WINDOW // 2)).mean() >= MIN_AVG_VALUE
+    avg_eligible = liq_mask.sum(axis=1).mean()
+    print(f"  Avg Eligible Stocks (PIT Liquidity): {avg_eligible:.0f}")
+else:
+    liq_mask = pd.DataFrame(True, index=close_df.index, columns=close_df.columns)
+
+
+def pit_eligible_at(dt):
+    """주어진 날짜에 PIT Universe + PIT Liquidity를 모두 통과하는 종목 반환"""
+    # 1) PIT Universe membership
+    if USE_PIT_UNIVERSE:
+        pit_univ = get_pit_eligible(dt, universe_by_quarter, quarter_ends)
+    else:
+        pit_univ = set(all_tickers)
+
+    # 2) PIT Liquidity
+    if USE_LIQ_FILTER and dt in liq_mask.index:
+        liq_ok = set(liq_mask.columns[liq_mask.loc[dt] == True])
+    else:
+        liq_ok = set(all_tickers)
+
+    # 3) 데이터 존재
+    has_data = set(t for t in all_tickers if pd.notna(close_df.loc[dt, t]) if t in close_df.columns)
+
+    return pit_univ & liq_ok & has_data
+
+
+# ================================================================
+#  FACTOR CONFLICT DETECTOR (v4.1)
+# ================================================================
+def detect_factor_conflicts(z_bd_row, z_m_row, basket_set, thr=FACTOR_CONFLICT_THR):
+    conflicts = []
+    for tk in basket_set:
+        if tk not in z_bd_row or tk not in z_m_row:
+            continue
+        zb = z_bd_row[tk]
+        zm = z_m_row[tk]
+        if pd.isna(zb) or pd.isna(zm):
+            continue
+        if zb > thr and zm > thr:
+            conflicts.append((tk, "BD_short_MOM_long", zb, zm))
+        elif zb < -thr and zm < -thr:
+            conflicts.append((tk, "BD_long_MOM_short", zb, zm))
+    return conflicts
+
+
+# ================================================================
+#  BACKTEST ENGINE
+# ================================================================
+def run_backtest(dates, w_bd=W_BETADIFF_DEF, w_mom=W_MOM_DEF, w_lv=W_LOWVOL_DEF,
+                 gate_thr=3, use_guard=False, use_conflict=False,
+                 use_short_sl=False, use_ic_sizing=False,
+                 top_k=TOP_K, use_futures_hedge=False, label="Strategy"):
+    """
+    use_futures_hedge=True: 개별 종목 숏 대신 롱 포트폴리오의 KOSPI 델타만큼
+                            KOSPI 선물을 숏하여 헤지. 공매도 불가 시 대안.
+    """
+    daily_rets = pd.Series(dtype=float)
+    positions_log = []
+    turnover_log = []
+    ic_series = pd.Series(dtype=float)
+    conflict_log = []
+
+    prev_long = set()
+    prev_short = set()
+    short_entry_prices = {}
+
+    for i, dt in enumerate(dates):
+        if dt not in close_df.index:
+            continue
+        loc = close_df.index.get_loc(dt)
+        if loc < BETA_SPAN + 20:
+            continue
+
+        # PIT eligible: universe membership + liquidity + data existence
+        avail = list(pit_eligible_at(dt))
+        if len(avail) < top_k * 3:
+            continue
+
+        score = (w_bd * z_betadiff.loc[dt, avail].fillna(0)
+                 + w_mom * z_mom.loc[dt, avail].fillna(0)
+                 + w_lv * z_lowvol.loc[dt, avail].fillna(0))
+        score = score.dropna().sort_values()
+
+        if len(score) < top_k * 2:
+            continue
+
+        # Long: highest composite (v3.1과 동일 — 높은 BetaDiff + 높은 Momentum)
+        long_cands = score.tail(top_k * 2).index.tolist()
+        # Short: lowest composite
+        short_cands = score.head(top_k * 2).index.tolist()
+
+        if use_guard and len(short_cands) > top_k:
+            mom_vals = z_mom.loc[dt, short_cands].fillna(0)
+            mom_thr = mom_vals.quantile(SHORT_MOM_GUARD_PCT)
+            guarded = [t for t in short_cands if mom_vals.get(t, 0) < mom_thr]
+            if len(guarded) >= top_k:
+                short_cands = guarded
+
+        long_basket = long_cands[:top_k]
+        short_basket = short_cands[:top_k]
+
+        if use_conflict:
+            basket_set = set(long_basket) | set(short_basket)
+            conflicts = detect_factor_conflicts(
+                z_betadiff.loc[dt], z_mom.loc[dt], basket_set, FACTOR_CONFLICT_THR
+            )
+            if conflicts:
+                conflict_log.append((dt, len(conflicts)))
+                conflict_tickers = {c[0] for c in conflicts}
+                short_basket = [t for t in short_basket if t not in conflict_tickers]
+                extras = [t for t in short_cands if t not in set(short_basket) and t not in conflict_tickers]
+                short_basket = (short_basket + extras)[:top_k]
+
+        if use_ic_sizing and loc >= IC_LOOKBACK + 5:
+            fwd_ret = ret_df.iloc[loc - IC_LOOKBACK:loc].mean()
+            hist_score = z_betadiff.iloc[loc - IC_LOOKBACK - 1]
+            common = fwd_ret.dropna().index.intersection(hist_score.dropna().index)
+            if len(common) > 20:
+                ic_val, _ = spearmanr(hist_score[common], fwd_ret[common])
+                ic_series[dt] = ic_val
+
+        if gate_thr > 0:
+            g = gate_signal.get(dt, 0) if dt in gate_signal.index else 0
+            if g < gate_thr:
+                nxt_dt_loc = loc + 1
+                if nxt_dt_loc < len(close_df.index):
+                    nxt_rebal = dates[i + 1] if i + 1 < len(dates) else close_df.index[-1]
+                    nxt_loc = close_df.index.get_indexer([nxt_rebal], method="ffill")[0]
+                    period = ret_df.iloc[loc + 1:nxt_loc + 1]
+                    flat_rets = pd.Series(0.0, index=period.index)
+                    daily_rets = pd.concat([daily_rets, flat_rets])
+                prev_long = set()
+                prev_short = set()
+                continue
+
+        exposure = 1.0
+        if use_ic_sizing and len(ic_series) > 0:
+            recent_ic = ic_series.iloc[-min(5, len(ic_series)):].mean()
+            if pd.notna(recent_ic):
+                if recent_ic < IC_MIN_THRESHOLD:
+                    exposure = EXPOSURE_SCALE_MIN
+                else:
+                    exposure = min(1.0, max(EXPOSURE_SCALE_MIN, recent_ic / 0.05))
+
+        n_long = len(long_basket)
+        n_short = len(short_basket)
+        if n_long == 0:
+            continue
+        # 선물 헤지 모드에서는 숏 바스켓 불필요
+        if not use_futures_hedge and n_short == 0:
+            continue
+
+        w_long = np.ones(n_long) / n_long
+
+        if use_futures_hedge:
+            # ── KOSPI 선물 헤지 모드 ──
+            # 롱 포트폴리오의 KOSPI 베타(델타)를 계산하고, 그만큼 선물 숏
+            bL_kospi = beta_kospi.loc[dt, long_basket].fillna(1.0).values
+            port_delta = np.dot(w_long, bL_kospi)  # 포트폴리오 KOSPI 델타
+            g_hedge = max(port_delta, 0.3)  # 최소 0.3 헤지
+            short_basket = []  # 개별 숏 없음
+            w_short = np.array([])
+        else:
+            w_short = np.ones(n_short) / n_short
+            # 기존 헤지 비율 계산
+            bL = beta_usdkrw.loc[dt, long_basket].fillna(0).values
+            bS = beta_usdkrw.loc[dt, short_basket].fillna(0).values
+            bL_mean = np.mean(bL)
+            bS_mean = np.mean(bS)
+            if abs(bL_mean) > 1e-6:
+                g_hedge = np.clip(bS_mean / bL_mean, 0.6, 1.6)
+            else:
+                g_hedge = 1.0
+
+        new_long = set(long_basket)
+        new_short = set(short_basket)
+        to = len(new_long - prev_long) + len(new_short - prev_short)
+        turnover_log.append((dt, to))
+        prev_long = new_long
+        prev_short = new_short
+
+        if use_short_sl:
+            for tk in short_basket:
+                if tk not in short_entry_prices:
+                    short_entry_prices[tk] = close_df.loc[dt, tk]
+            short_entry_prices = {k: v for k, v in short_entry_prices.items() if k in new_short}
+
+        nxt_rebal = dates[i + 1] if i + 1 < len(dates) else close_df.index[-1]
+        nxt_loc = close_df.index.get_indexer([nxt_rebal], method="ffill")[0]
+        period_rets = ret_df.iloc[loc + 1:nxt_loc + 1]
+
+        for day_idx in range(len(period_rets)):
+            day = period_rets.index[day_idx]
+            r_long = period_rets.loc[day, long_basket].fillna(0).values
+
+            if use_futures_hedge:
+                # 롱 수익 - KOSPI 선물 숏 수익 (델타 헤지)
+                r_kospi_day = ret_kospi.get(day, 0.0) if day in ret_kospi.index else 0.0
+                pnl_l = np.dot(w_long, r_long)
+                pnl_s = g_hedge * r_kospi_day  # 선물 숏 PnL
+                raw_pnl = pnl_l - pnl_s
+            else:
+                r_short = period_rets.loc[day, short_basket].fillna(0).values
+
+                if use_short_sl:
+                    for j, tk in enumerate(short_basket):
+                        if tk in short_entry_prices:
+                            curr_price = close_df.loc[day, tk] if day in close_df.index else np.nan
+                            if pd.notna(curr_price) and short_entry_prices[tk] > 0:
+                                # 숏 누적 PnL: (진입가 - 현재가) / 진입가
+                                # 음수 = 숏 손실 (종목 급등)
+                                cum_pnl = (short_entry_prices[tk] - curr_price) / short_entry_prices[tk]
+                                if cum_pnl < SHORT_STOP_LOSS:
+                                    # 손절 발동: 오늘 일별 수익은 그대로 반영 (손실 실현)
+                                    # 내일부터 이 종목은 무시 (포지션 종료)
+                                    short_entry_prices[tk] = -1  # 마킹: 이미 손절됨
+                            elif short_entry_prices.get(tk) == -1:
+                                # 이미 손절된 종목: 이후 수익 0 처리
+                                r_short[j] = 0.0
+
+                pnl_l = np.dot(w_long, r_long)
+                pnl_s = np.dot(w_short, r_short)
+                raw_pnl = g_hedge * pnl_l - pnl_s
+
+            cost = 0.0
+            if day_idx == 0:
+                cost = to * SIDE_COST * 2 / (top_k * 2)
+            cost += BORROW_PA / 252
+
+            daily_pnl = raw_pnl * exposure - cost
+            daily_rets[day] = daily_pnl
+
+        positions_log.append({
+            "date": dt,
+            "long": long_basket,
+            "short": short_basket,
+            "hedge_ratio": g_hedge,
+            "exposure": exposure,
+            "gate": gate_signal.get(dt, 0) if dt in gate_signal.index else 0,
+        })
+
+    daily_rets = daily_rets.sort_index()
+    daily_rets = daily_rets[~daily_rets.index.duplicated(keep='last')]
+
+    return {
+        "rets": daily_rets,
+        "equity": (1 + daily_rets).cumprod(),
+        "positions": positions_log,
+        "turnover": turnover_log,
+        "ic_series": ic_series,
+        "conflict_log": conflict_log,
+    }
+
+
+# ================================================================
+#  PHASE 1: FULL PERIOD BACKTEST
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 1: Full Period Backtest")
+print("=" * 70)
+
+configs = {
+    "B_strict": {
+        "gate_thr": 0, "use_guard": False, "use_conflict": False,
+        "use_short_sl": False, "use_ic_sizing": False,
+    },
+    "B_strict_v41": {
+        "gate_thr": 0, "use_guard": True, "use_conflict": True,
+        "use_short_sl": True, "use_ic_sizing": False,  # IC Sizing OFF (ablation에서 해로움 확인)
+    },
+    "Bplus_v41": {
+        "gate_thr": 3, "use_guard": True, "use_conflict": True,
+        "use_short_sl": True, "use_ic_sizing": False,
+    },
+}
+
+full_results = {}
+all_metrics = []
+
+for name, cfg in configs.items():
+    print(f"\n  Running [{name}]...")
+    res = run_backtest(dates_all, label=name, **cfg)
+    full_results[name] = res
+    m = full_metrics(res["rets"], name)
+    m["Time_in_Mkt"] = round(len(res["rets"][res["rets"] != 0]) / max(len(res["rets"]), 1), 4)
+    all_metrics.append(m)
+    eq = res["equity"]
+    print(f"    Sharpe: {m['Sharpe']:.4f} | CAGR: {m['CAGR']:.2%} | "
+          f"MaxDD: {m['MaxDD']:.2%} | Sortino: {m['Sortino']:.4f} | "
+          f"Calmar: {m['Calmar']:.4f} | PF: {m['ProfitFactor']:.4f}")
+
+full_df = pd.DataFrame(all_metrics).set_index("Strategy")
+print("\n┌─── FULL METRICS ───┐")
+print(full_df.to_string())
+
+
+# ================================================================
+#  PHASE 1.5: ABLATION TEST (v41 가드 효과 분리)
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 1.5: Ablation Test — v41 Guards 하나씩 분리")
+print("=" * 70)
+
+ablation_configs = {
+    # 기본 (가드 전부 OFF) = B_strict과 동일
+    "Base (no guards)": {
+        "gate_thr": 0, "use_guard": False, "use_conflict": False,
+        "use_short_sl": False, "use_ic_sizing": False,
+    },
+    # Guard만 ON
+    "+ShortMomGuard": {
+        "gate_thr": 0, "use_guard": True, "use_conflict": False,
+        "use_short_sl": False, "use_ic_sizing": False,
+    },
+    # Conflict만 ON
+    "+ConflictDetect": {
+        "gate_thr": 0, "use_guard": False, "use_conflict": True,
+        "use_short_sl": False, "use_ic_sizing": False,
+    },
+    # ShortSL만 ON
+    "+ShortStopLoss": {
+        "gate_thr": 0, "use_guard": False, "use_conflict": False,
+        "use_short_sl": True, "use_ic_sizing": False,
+    },
+    # IC Sizing만 ON
+    "+IC_Sizing": {
+        "gate_thr": 0, "use_guard": False, "use_conflict": False,
+        "use_short_sl": False, "use_ic_sizing": True,
+    },
+    # Guard + Conflict (2개 조합)
+    "+Guard+Conflict": {
+        "gate_thr": 0, "use_guard": True, "use_conflict": True,
+        "use_short_sl": False, "use_ic_sizing": False,
+    },
+    # Guard + Conflict + SL (3개 조합)
+    "+Guard+Conflict+SL": {
+        "gate_thr": 0, "use_guard": True, "use_conflict": True,
+        "use_short_sl": True, "use_ic_sizing": False,
+    },
+    # 전부 ON (IC Sizing 제외) = B_strict_v41
+    "ALL (Guard+Conflict+SL)": {
+        "gate_thr": 0, "use_guard": True, "use_conflict": True,
+        "use_short_sl": True, "use_ic_sizing": False,
+    },
+}
+
+ablation_rows = []
+for name, cfg in ablation_configs.items():
+    print(f"\n  Running [{name}]...")
+    res_a = run_backtest(dates_all, label=name, **cfg)
+    m_a = full_metrics(res_a["rets"], name)
+    ablation_rows.append(m_a)
+    print(f"    Sharpe: {m_a['Sharpe']:.4f} | CAGR: {m_a['CAGR']:.2%} | "
+          f"MaxDD: {m_a['MaxDD']:.2%} | Sortino: {m_a['Sortino']:.4f} | "
+          f"WinRate: {m_a['WinRate']:.4f}")
+
+abl_df = pd.DataFrame(ablation_rows)
+print("\n┌─── ABLATION TEST RESULTS ───┐")
+print(abl_df[["Strategy", "Sharpe", "CAGR", "MaxDD", "Sortino",
+              "Calmar", "ProfitFactor", "WinRate"]].to_string(index=False))
+
+# Base 대비 각 가드의 Sharpe 기여도
+base_sharpe = ablation_rows[0]["Sharpe"]
+print(f"\n┌─── MARGINAL SHARPE CONTRIBUTION (vs Base {base_sharpe:.4f}) ───┐")
+for row in ablation_rows[1:]:
+    delta = row["Sharpe"] - base_sharpe
+    pct = (delta / abs(base_sharpe) * 100) if base_sharpe != 0 else 0
+    flag = "🟢" if delta > 0.1 else ("🔴" if delta < -0.1 else "⚪")
+    print(f"  {flag} {row['Strategy']:25s}  Sharpe: {row['Sharpe']:.4f}  "
+          f"Δ: {delta:+.4f} ({pct:+.1f}%)")
+
+abl_df.to_csv(os.path.join(OUTDIR, "ablation_test.csv"), index=False)
+
+
+# ================================================================
+#  PHASE 2: ROLLING WALK-FORWARD
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 2: Rolling Walk-Forward")
+print("=" * 70)
+
+wf_results = []
+wf_start = close_df.index[0]
+wf_end = close_df.index[-1]
+
+window_start = wf_start
+window_idx = 0
+
+while True:
+    train_end = window_start + pd.DateOffset(months=WF_TRAIN_MONTHS)
+    test_end  = train_end + pd.DateOffset(months=WF_TEST_MONTHS)
+
+    if train_end > wf_end:
+        break
+
+    test_end_actual = min(test_end, wf_end)
+    test_dates = [d for d in dates_all if train_end <= d <= test_end_actual]
+
+    if len(test_dates) < 2:
+        window_start += pd.DateOffset(months=WF_STEP_MONTHS)
+        continue
+
+    window_idx += 1
+    period_label = f"W{window_idx}({train_end.strftime('%y%m')}~{test_end_actual.strftime('%y%m')})"
+
+    for name, cfg in configs.items():
+        res = run_backtest(test_dates, label=name, **cfg)
+        if len(res["rets"]) > 5:
+            s = ann_sharpe(res["rets"])
+            c = ann_cagr(res["equity"])
+            d = max_dd(res["equity"])
+        else:
+            s, c, d = np.nan, np.nan, np.nan
+
+        wf_results.append({
+            "Window": period_label,
+            "Strategy": name,
+            "OOS_Sharpe": round(s, 4) if pd.notna(s) else np.nan,
+            "OOS_CAGR": round(c, 4) if pd.notna(c) else np.nan,
+            "OOS_MaxDD": round(d, 4) if pd.notna(d) else np.nan,
+            "N_Days": len(res["rets"]),
+        })
+
+    window_start += pd.DateOffset(months=WF_STEP_MONTHS)
+
+wf_df = pd.DataFrame(wf_results)
+if not wf_df.empty:
+    print("\n┌─── WALK-FORWARD OOS ───┐")
+    for name in configs:
+        sub = wf_df[wf_df["Strategy"] == name]
+        avg_s = sub["OOS_Sharpe"].mean()
+        print(f"  [{name}] Avg OOS Sharpe: {avg_s:.4f}")
+        print(sub[["Window", "OOS_Sharpe", "OOS_CAGR", "OOS_MaxDD"]].to_string(index=False))
+        print()
+
+
+# ================================================================
+#  PHASE 3: SUB-PERIOD ANALYSIS
+# ================================================================
+print("=" * 70)
+print(" PHASE 3: Sub-Period Analysis")
+print("=" * 70)
+
+def sub_period_table(results_dict, freq="Y"):
+    rows = []
+    for name, res in results_dict.items():
+        rets = res["rets"]
+        if freq == "Y":
+            groups = rets.groupby(rets.index.year)
+        else:
+            groups = rets.groupby([rets.index.year, rets.index.month.map(lambda m: "H1" if m <= 6 else "H2")])
+
+        for period, grp in groups:
+            if len(grp) < 10:
+                continue
+            eq = (1 + grp).cumprod()
+            lbl = str(period) if freq == "Y" else f"{period[0]}-{period[1]}"
+            rows.append({
+                "Strategy": name, "Period": lbl,
+                "Return": round(eq.iloc[-1] / eq.iloc[0] - 1, 4),
+                "Sharpe": round(ann_sharpe(grp), 4),
+                "MaxDD": round(max_dd(eq), 4),
+                "WinRate": round((grp > 0).mean(), 4),
+                "Days": len(grp),
+            })
+    return pd.DataFrame(rows)
+
+yearly = sub_period_table(full_results, "Y")
+semi = sub_period_table(full_results, "H")
+
+print("\n┌─── YEARLY ───┐")
+for name in configs:
+    sub = yearly[yearly["Strategy"] == name]
+    if sub.empty:
+        continue
+    print(f"\n  [{name}]")
+    print(sub[["Period", "Return", "Sharpe", "MaxDD", "WinRate", "Days"]].to_string(index=False))
+
+print("\n┌─── SEMI-ANNUAL ───┐")
+for name in configs:
+    sub = semi[semi["Strategy"] == name]
+    if sub.empty:
+        continue
+    print(f"\n  [{name}]")
+    print(sub[["Period", "Return", "Sharpe", "MaxDD", "WinRate"]].to_string(index=False))
+
+
+# ================================================================
+#  PHASE 4: DRAWDOWN EVENT ANALYSIS
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 4: Drawdown Events (>5%)")
+print("=" * 70)
+
+def dd_events(equity, threshold=-0.05):
+    peak = equity.cummax()
+    dd = equity / peak - 1
+    events = []
+    in_dd = False
+    start = None
+    for i, (dt, val) in enumerate(dd.items()):
+        if val < threshold and not in_dd:
+            in_dd = True
+            start = dt
+        elif val >= 0 and in_dd:
+            in_dd = False
+            trough_idx = dd.loc[start:dt].idxmin()
+            events.append({
+                "Start": start.strftime("%Y-%m-%d"),
+                "Trough": trough_idx.strftime("%Y-%m-%d"),
+                "End": dt.strftime("%Y-%m-%d"),
+                "Depth": round(dd.loc[trough_idx], 4),
+                "Duration_Days": (dt - start).days,
+                "Recovery_Days": (dt - trough_idx).days,
+            })
+    if in_dd and start is not None:
+        trough_idx = dd.loc[start:].idxmin()
+        events.append({
+            "Start": start.strftime("%Y-%m-%d"),
+            "Trough": trough_idx.strftime("%Y-%m-%d"),
+            "End": "Ongoing",
+            "Depth": round(dd.loc[trough_idx], 4),
+            "Duration_Days": (dd.index[-1] - start).days,
+            "Recovery_Days": None,
+        })
+    return events
+
+for name in configs:
+    eq = full_results[name]["equity"]
+    evts = dd_events(eq)
+    print(f"\n  [{name}] {len(evts)} events:")
+    if evts:
+        edf = pd.DataFrame(evts)
+        print(edf.to_string(index=False))
+
+
+# ================================================================
+#  PHASE 5: COST SENSITIVITY
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 5: Cost Sensitivity")
+print("=" * 70)
+
+cost_rows = []
+for bps in [0, 2, 4, 6, 8, 10, 12, 15, 20]:
+    base_cost = COST_BPS_PER_SIDE
+    diff = (bps - base_cost) / 10000.0
+    for name in configs:
+        rets = full_results[name]["rets"].copy()
+        rebal_mask = rets.index.isin([d for d, _ in full_results[name]["turnover"]])
+        adj_rets = rets.copy()
+        adj_rets[rebal_mask] -= diff * 2
+        eq = (1 + adj_rets).cumprod()
+        cost_rows.append({
+            "Cost_BPS": bps, "Strategy": name,
+            "Sharpe": round(ann_sharpe(adj_rets), 4),
+            "CAGR": round(ann_cagr(eq), 4),
+        })
+
+cdf = pd.DataFrame(cost_rows)
+print("\n  Cost Sensitivity Matrix:")
+pivot = cdf.pivot_table(index="Cost_BPS", columns="Strategy", values="Sharpe")
+print(pivot.to_string())
+
+
+# ================================================================
+#  PHASE 6: FACTOR DECAY & HALF-LIFE
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 6: Factor Decay Analysis")
+print("=" * 70)
+
+decay_results = {}
+for lag in range(1, 21):
+    fwd = ret_df.shift(-lag)
+    common_dates = z_betadiff.index.intersection(fwd.dropna(how="all").index)
+    ics = []
+    for dt in common_dates[::5]:
+        row_f = fwd.loc[dt].dropna()
+        row_z = z_betadiff.loc[dt].dropna()
+        common = row_f.index.intersection(row_z.index)
+        if len(common) > 20:
+            c, _ = spearmanr(row_z[common], row_f[common])
+            ics.append(c)
+    if ics:
+        mean_ic = np.mean(ics)
+        t_stat = mean_ic / (np.std(ics) / np.sqrt(len(ics))) if np.std(ics) > 0 else 0
+        decay_results[lag] = {"Mean_IC": round(mean_ic, 6), "T_stat": round(t_stat, 4), "N": len(ics)}
+
+decay = pd.DataFrame(decay_results).T
+decay.index.name = "Lag_Days"
+print(decay.to_string())
+
+if len(decay) > 2 and decay["Mean_IC"].iloc[0] != 0:
+    half_val = decay["Mean_IC"].iloc[0] / 2
+    crossed = decay[decay["Mean_IC"].abs() < abs(half_val)]
+    if not crossed.empty:
+        hl = crossed.index[0]
+        print(f"\n  Estimated Half-Life: {hl} days")
+    else:
+        print(f"\n  Half-Life: > 20 days")
+
+
+# ================================================================
+#  PHASE 7: CAPACITY ESTIMATE
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 7: Capacity Estimate")
+print("=" * 70)
+
+last_pos = None
+for name in ["B_strict_v41", "B_strict"]:
+    if name in full_results and full_results[name]["positions"]:
+        last_pos = full_results[name]["positions"][-1]
+        break
+
+if last_pos:
+    all_basket = last_pos["long"] + last_pos["short"]
+    avg_adv = []
+    for tk in all_basket:
+        if tk in value_df.columns:
+            adv = value_df[tk].iloc[-60:].mean()
+            avg_adv.append(adv)
+    if avg_adv:
+        min_adv = min(avg_adv)
+        cap_per_stock = min_adv * 0.05
+        total_cap = cap_per_stock * len(all_basket)
+        print(f"  Min ADV (60d): {min_adv/1e8:.1f}억")
+        print(f"  Capacity per stock (5% ADV): {cap_per_stock/1e8:.1f}억")
+        print(f"  Total Capacity ({len(all_basket)} stocks): {total_cap/1e8:.0f}억")
+    else:
+        print("  No ADV data available.")
+else:
+    print("  No position data available.")
+
+
+# ================================================================
+#  PHASE 8: FACTOR IC MONITOR
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 8: Factor IC Monitor")
+print("=" * 70)
+
+ic_full = pd.Series(dtype=float)
+for i in range(IC_LOOKBACK + 5, len(close_df.index), 5):
+    dt = close_df.index[i]
+    fwd_ret = ret_df.iloc[i:i + 5].mean()
+    hist_score = z_betadiff.iloc[i - 1]
+    common = fwd_ret.dropna().index.intersection(hist_score.dropna().index)
+    if len(common) > 20:
+        c, _ = spearmanr(hist_score[common], fwd_ret[common])
+        ic_full[dt] = c
+
+ic_clean = ic_full.dropna()
+if len(ic_clean) > 0:
+    ic_now = ic_clean.iloc[-1]
+    ic_avg = ic_clean.mean()
+    ic_std = ic_clean.std()
+    ic_ir = ic_avg / ic_std if ic_std > 0 else 0
+    print(f"  Current IC:   {ic_now:.4f}")
+    print(f"  Average IC:   {ic_avg:.4f}")
+    print(f"  IC Std:       {ic_std:.4f}")
+    print(f"  IC-IR:        {ic_ir:.4f}")
+else:
+    ic_now = np.nan
+    print("  No valid IC data.")
+
+
+# ================================================================
+#  PHASE 9: CONSOLIDATED DASHBOARD (Plotly HTML)
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 9: Dashboard")
+print("=" * 70)
+
+try:
+    fig = make_subplots(
+        rows=5, cols=2,
+        subplot_titles=[
+            "Equity Curves", "Drawdowns",
+            "Rolling 63d Sharpe", "Gate Score",
+            "Factor IC (Rolling)", "Yearly Sharpe Heatmap",
+            "Cost Sensitivity", "Walk-Forward OOS Sharpe",
+            "Turnover", "Factor Decay IC",
+        ],
+        vertical_spacing=0.06,
+    )
+
+    cm = {"B_strict": "#2196F3", "B_strict_v41": "#4CAF50", "Bplus_v41": "#FF9800"}
+
+    for name, res in full_results.items():
+        eq = res["equity"]
+        dd = eq / eq.cummax() - 1
+        roll_s = res["rets"].rolling(63).apply(lambda x: ann_sharpe(x), raw=False)
+
+        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name=name,
+                                 line=dict(color=cm.get(name))), row=1, col=1)
+        fig.add_trace(go.Scatter(x=dd.index, y=dd.values, name=f"{name} DD",
+                                 line=dict(color=cm.get(name)), showlegend=False), row=1, col=2)
+        fig.add_trace(go.Scatter(x=roll_s.index, y=roll_s.values, name=f"{name} RS",
+                                 line=dict(color=cm.get(name)), showlegend=False), row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=gate_signal.index, y=gate_signal.values,
+                             name="Gate", line=dict(color="red")), row=2, col=2)
+
+    if len(ic_clean) > 0:
+        fig.add_trace(go.Scatter(x=ic_clean.index, y=ic_clean.values,
+                                 name="IC", line=dict(color="purple")), row=3, col=1)
+
+    if not yearly.empty:
+        for name in configs:
+            sub = yearly[yearly["Strategy"] == name]
+            fig.add_trace(go.Bar(x=sub["Period"], y=sub["Sharpe"], name=f"{name} YR",
+                                 marker_color=cm.get(name)), row=3, col=2)
+
+    if not cdf.empty:
+        for name in configs:
+            sub = cdf[cdf["Strategy"] == name]
+            fig.add_trace(go.Scatter(x=sub["Cost_BPS"], y=sub["Sharpe"],
+                                     name=f"{name} Cost", mode="lines+markers",
+                                     line=dict(color=cm.get(name)), showlegend=False), row=4, col=1)
+
+    if not wf_df.empty:
+        for name in configs:
+            sub = wf_df[wf_df["Strategy"] == name]
+            fig.add_trace(go.Bar(x=sub["Window"], y=sub["OOS_Sharpe"],
+                                 name=f"{name} OOS", marker_color=cm.get(name),
+                                 showlegend=False), row=4, col=2)
+
+    for name, res in full_results.items():
+        if res["turnover"]:
+            to_df = pd.DataFrame(res["turnover"], columns=["date", "turnover"])
+            fig.add_trace(go.Scatter(x=to_df["date"], y=to_df["turnover"],
+                                     name=f"{name} TO", line=dict(color=cm.get(name)),
+                                     showlegend=False), row=5, col=1)
+
+    if len(decay) > 0:
+        fig.add_trace(go.Scatter(x=decay.index, y=decay["Mean_IC"],
+                                 name="Decay IC", mode="lines+markers",
+                                 line=dict(color="darkred")), row=5, col=2)
+
+    fig.update_layout(
+        height=2200, width=1400,
+        title_text="KRX L/S Quant v4.1.1-fix2 — Full Dashboard",
+        template="plotly_white",
+        showlegend=True,
+        barmode="group",
+    )
+    dash_path = os.path.join(OUTDIR, "dashboard_v411.html")
+    fig.write_html(dash_path)
+    print(f"  ✅ Saved: {dash_path}")
+except Exception as e:
+    print(f"  ⚠️ Dashboard Error: {e}")
+
+
+# ================================================================
+#  PHASE 10: LIVE BASKET & AUTO WARNINGS
+# ================================================================
+print("\n" + "=" * 70)
+print(" PHASE 10: Live Basket & Warnings")
+print("=" * 70)
+
+def get_ticker_name(tk):
+    """종목명 조회 — FDR > pykrx > yfinance"""
+    # FDR listing에서 찾기
+    if FDR_AVAILABLE and DATA_SOURCE == "fdr" and probe_result is not None:
+        try:
+            code_col = "Code" if "Code" in probe_result.columns else probe_result.columns[0]
+            name_col = "Name" if "Name" in probe_result.columns else None
+            if name_col:
+                match = probe_result[probe_result[code_col].astype(str).str.zfill(6) == tk]
+                if not match.empty:
+                    return match[name_col].iloc[0]
+        except Exception:
+            pass
+    if PYKRX_AVAILABLE:
+        try:
+            nm = stock.get_market_ticker_name(tk)
+            if nm:
+                return nm
+        except Exception:
+            pass
+    try:
+        info = yf.Ticker(f"{tk}.KS").info
+        return info.get("shortName", info.get("longName", tk))
+    except Exception:
+        return tk
+
+
+for name in ["B_strict_v41", "Bplus_v41"]:
+    if name not in full_results:
+        continue
+    pos_list = full_results[name]["positions"]
+    if not pos_list:
+        continue
+    last = pos_list[-1]
+    print(f"\n  [{name}] Latest Basket ({last['date'].strftime('%Y-%m-%d')}):")
+    print(f"    Gate: {last['gate']}/5 | Hedge: {last['hedge_ratio']:.4f} | "
+          f"Exposure: {last['exposure']:.2f}")
+
+    long_names = []
+    short_names = []
+    for tk in last["long"]:
+        nm = get_ticker_name(tk)
+        long_names.append({"Ticker": tk, "Name": nm})
+    for tk in last["short"]:
+        nm = get_ticker_name(tk)
+        short_names.append({"Ticker": tk, "Name": nm})
+
+    print(f"\n    LONG ({len(long_names)}):")
+    for x in long_names:
+        print(f"      {x['Ticker']} {x['Name']}")
+    print(f"\n    SHORT ({len(short_names)}):")
+    for x in short_names:
+        print(f"      {x['Ticker']} {x['Name']}")
+
+    try:
+        xl_path = os.path.join(OUTDIR, f"basket_{name}.xlsx")
+        with pd.ExcelWriter(xl_path, engine="openpyxl") as writer:
+            pd.DataFrame(long_names).to_excel(writer, sheet_name="Long", index=False)
+            pd.DataFrame(short_names).to_excel(writer, sheet_name="Short", index=False)
+        print(f"    ✅ Saved: {xl_path}")
+    except Exception as e:
+        print(f"    ⚠️ Excel Error: {e}")
+
+
+# --- Auto Warnings ---
+print("\n┌─── AUTO WARNINGS ───┐")
+warnings_list = []
+
+last_gate = gate_signal.iloc[-1] if len(gate_signal) > 0 else 0
+if last_gate < 3:
+    warnings_list.append(f"🔴 GATE OFF (S_raw={int(last_gate)}/5) — 전략이 현재 Flat 상태.")
+
+if pd.notna(ic_now) and ic_now < 0:
+    warnings_list.append(f"⚠️ IC NEGATIVE ({ic_now:.4f}) — 팩터 예측력 약화.")
+elif pd.notna(ic_now) and ic_now < IC_MIN_THRESHOLD:
+    warnings_list.append(f"⚡ IC LOW ({ic_now:.4f}) — 팩터 예측력 약함.")
+
+for key in configs:
+    if key not in full_results:
+        continue
+    eq = full_results[key]["equity"]
+    if len(eq) < 2:
+        continue
+    curr_dd = eq.iloc[-1] / eq.max() - 1
+    if curr_dd < -0.10:
+        warnings_list.append(f"🔴 {key}: 현재 DD {curr_dd:.1%}")
+    elif curr_dd < -0.05:
+        warnings_list.append(f"⚡ {key}: 현재 DD {curr_dd:.1%}")
+
+if not USE_PIT_UNIVERSE:
+    warnings_list.append("⚠️ PIT Universe 미사용 — survivorship bias 가능성")
+elif PIT_SOURCE == "FDR":
+    warnings_list.append("⚡ PIT Universe: FDR 폴백 (현재 시점 고정)")
+if delisted > len(all_universe_tickers) * 0.1:
+    warnings_list.append(f"⚠️ 상폐 비율 {delisted / len(all_universe_tickers) * 100:.1f}%")
+
+for key in ["B_strict_v41", "Bplus_v41"]:
+    if key in full_results and full_results[key]["conflict_log"]:
+        last_conflict = full_results[key]["conflict_log"][-1]
+        warnings_list.append(f"⚡ {key}: Factor Conflict {last_conflict[1]}개 ({last_conflict[0].strftime('%Y-%m-%d')})")
+
+ndx_na_pct = macro_df["NDX"].isna().mean()
+if ndx_na_pct > 0.1:
+    warnings_list.append(f"⚠️ NDX 결측률 {ndx_na_pct:.1%}")
+
+# 데이터 소스 경고
+if DATA_SOURCE == "yfinance":
+    warnings_list.append("⚠️ 데이터소스: yfinance 폴백 — 유니버스 하드코딩")
+elif DATA_SOURCE == "krx_otp":
+    warnings_list.append("⚡ 데이터소스: KRX OTP 직접 크롤링")
+elif DATA_SOURCE == "fdr":
+    pass  # FDR은 정상 소스이므로 경고 불필요
+
+if warnings_list:
+    for w in warnings_list:
+        print(f"  {w}")
+else:
+    print("  ✅ No warnings.")
+
+try:
+    nxt = pd.Timestamp(dates_all[-1]) + BMonthBegin(1) + BDay(4)
+    print(f"\n  📅 Next Rebalance: {nxt.strftime('%Y-%m-%d')}")
+except Exception:
+    pass
+
+
+# ================================================================
+#  SAVE ALL OUTPUTS
+# ================================================================
+print("\n" + "=" * 70)
+print(" SAVING OUTPUTS")
+print("=" * 70)
+
+full_df.to_csv(os.path.join(OUTDIR, "full_metrics_v411.csv"))
+if not wf_df.empty:
+    wf_df.to_csv(os.path.join(OUTDIR, "walkforward_v411.csv"), index=False)
+yearly.to_csv(os.path.join(OUTDIR, "yearly_v411.csv"), index=False)
+semi.to_csv(os.path.join(OUTDIR, "semi_annual_v411.csv"), index=False)
+cdf.to_csv(os.path.join(OUTDIR, "cost_sensitivity_v411.csv"), index=False)
+if len(decay) > 0:
+    decay.to_csv(os.path.join(OUTDIR, "decay_v411.csv"))
+if len(ic_clean) > 0:
+    ic_clean.to_csv(os.path.join(OUTDIR, "factor_ic_v411.csv"))
+
+try:
+    fig2, ax = plt.subplots(1, 1, figsize=(14, 6))
+    for name, res in full_results.items():
+        ax.plot(res["equity"].index, res["equity"].values, label=name, linewidth=1.5)
+    ax.set_title("KRX L/S Quant v4.1.1-fix2 — Equity Curves", fontsize=14, fontweight="bold")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    eq_path = os.path.join(OUTDIR, "equity_curves_v411.png")
+    fig2.savefig(eq_path, dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"  ✅ {eq_path}")
+except Exception as e:
+    print(f"  ⚠️ Matplotlib Error: {e}")
+
+print(f"\n  All outputs saved to: {OUTDIR}/")
+print("\n" + "=" * 70)
+print(" v4.1.1-fix2 Complete. ✅")
+print(f" Data Source Used: {DATA_SOURCE}")
+print("=" * 70)
+
+# ================================================================
+#  GOOGLE COLAB DOWNLOAD (optional)
+# ================================================================
+try:
+    import zipfile
+    zip_path = "krx_ls_v411_outputs.zip"
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, flist in os.walk(OUTDIR):
+            for f in flist:
+                fp = os.path.join(root, f)
+                zf.write(fp, arcname=f)
+    print(f"\n  📦 ZIP: {zip_path}")
+    try:
+        from google.colab import files as colab_files
+        colab_files.download(zip_path)
+    except ImportError:
+        print("  (Not in Colab — skip auto-download)")
+except Exception as e:
+    print(f"  ZIP Error: {e}")
